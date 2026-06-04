@@ -99,21 +99,84 @@ def capture_thread(cam, cam_id, trigger_event, stop_event, save_queue):
         CYAN(f"[Cam {cam_id}] Stream stopped.")
 
 
-def preview_thread(cam, cam_id, stop_preview_event):
-    """
-    Temporarily switches the camera to continuous (free-run) mode, streams
-    frames into an OpenCV window, then restores software trigger mode on exit.
-    Close the window or press 'q' inside it to stop.
-    """
-    window_name = f"cam_{cam_id}"
-    MAGENTA(f"[Preview] Cam {cam_id} starting. Press 'q' in the preview window to stop.")
+def start_capture_threads(cam1, cam2, trigger_evt1, trigger_evt2, save_queue):
+    """Spin up a fresh stop event, two capture threads, return all three."""
+    stop_evt = threading.Event()
 
+    t1 = threading.Thread(
+        target=capture_thread,
+        args=(cam1, 1, trigger_evt1, stop_evt, save_queue),
+        daemon=True,
+    )
+    t2 = threading.Thread(
+        target=capture_thread,
+        args=(cam2, 2, trigger_evt2, stop_evt, save_queue),
+        daemon=True,
+    )
+    t1.start()
+    t2.start()
+    return t1, t2, stop_evt
+
+
+def stop_capture_threads(t1, t2, stop_evt):
+    """Signal and join the current capture threads."""
+    stop_evt.set()
+    t1.join()
+    t2.join()
+
+
+def load_overlay(session_dir, dir_arg, cam_id):
+    """
+    Resolve a user-supplied dir_arg ("singles" or "loop_N") to an actual
+    path, find the image with the largest timestamp for the given cam_id,
+    and return it as a BGR numpy array, or None if nothing is found.
+    """
+    if dir_arg == "singles":
+        search_dir = os.path.join(session_dir, "singles", f"cam_{cam_id}")
+    else:
+        # expect format "loop_N"
+        search_dir = os.path.join(session_dir, "loops", f"cam_{cam_id}", dir_arg)
+
+    if not os.path.isdir(search_dir):
+        RED(f"[Preview] Overlay path not found: {search_dir}")
+        return None
+
+    tiffs = [f for f in os.listdir(search_dir) if f.endswith(".tiff")]
+    if not tiffs:
+        RED(f"[Preview] No images found in: {search_dir}")
+        return None
+
+    # Filenames are cam_{id}_{timestamp}.tiff — sort by timestamp numerically
+    def extract_timestamp(fname):
+        try:
+            return int(fname.replace(f"cam_{cam_id}_", "").replace(".tiff", ""))
+        except ValueError:
+            return 0
+
+    latest = max(tiffs, key=extract_timestamp)
+    path = os.path.join(search_dir, latest)
+
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        RED(f"[Preview] Failed to load overlay image: {path}")
+        return None
+
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    MAGENTA(f"[Preview] Cam {cam_id} overlay loaded: {latest}")
+    return img
+
+
+def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event):
+    """
+    Grab frames continuously in free-run mode and push the latest into
+    frame_buffer. Display is handled on the main thread.
+    """
     try:
-        # --- Switch to continuous mode for free-running preview ---
         cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
         cam.stream_on()
-
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        MAGENTA(f"[Preview] Cam {cam_id} capture started.")
 
         while not stop_preview_event.is_set():
             raw_image = cam.data_stream[0].get_image(timeout=100)
@@ -124,66 +187,99 @@ def preview_thread(cam, cam_id, stop_preview_event):
             if numpy_image is None:
                 continue
 
-            # Convert to BGR for OpenCV display (handles mono and colour)
             if numpy_image.ndim == 2:
                 display = cv2.cvtColor(numpy_image, cv2.COLOR_GRAY2BGR)
             else:
                 display = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
 
-            cv2.imshow(window_name, display)
-
-            # 'q' inside the window stops this camera's preview
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                stop_preview_event.set()
-                break
-
-            # Also stop if the window was closed with the X button
-            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                stop_preview_event.set()
-                break
+            with frame_lock:
+                frame_buffer[cam_id] = display
 
     except Exception as e:
-        RED(f"[Preview] Cam {cam_id} error: {e}")
+        RED(f"[Preview] Cam {cam_id} capture error: {e}")
     finally:
         cam.stream_off()
-        cv2.destroyWindow(window_name)
-
-        # --- Restore software trigger mode ---
         cam.TriggerMode.set(gx.GxSwitchEntry.ON)
         cam.TriggerSource.set(gx.GxTriggerSourceEntry.SOFTWARE)
-
         MAGENTA(f"[Preview] Cam {cam_id} stopped. Software trigger restored.")
 
 
-def start_preview(cam1, cam2):
+def blend_overlay(frame, overlay):
     """
-    Launch preview threads for both cameras. Blocks until both previews
-    are closed, then flushes buffers to prepare for triggered acquisition.
+    Resize overlay to match frame dimensions if needed, then alpha-blend
+    at 0.5 opacity onto the live frame.
     """
+    if overlay.shape[:2] != frame.shape[:2]:
+        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
+    return cv2.addWeighted(frame, 1.0, overlay, 0.5, 0)
+
+
+def start_preview(cam1, cam2, dir_arg=None):
+    """
+    Launch frame-grabbing threads for both cameras, then run the OpenCV
+    display loop on the main thread until both windows are closed or
+    'q' is pressed. If dir_arg is provided, the latest image from that
+    sub-directory is loaded per camera and overlaid at 0.5 opacity.
+    """
+    # Load overlays before starting threads so errors surface early
+    overlay1 = load_overlay(SESSION_DIR, dir_arg, 1) if dir_arg else None
+    overlay2 = load_overlay(SESSION_DIR, dir_arg, 2) if dir_arg else None
+
+    frame_buffer = {}
+    frame_lock = threading.Lock()
     stop_preview_evt = threading.Event()
 
     p1 = threading.Thread(
-        target=preview_thread,
-        args=(cam1, 1, stop_preview_evt),
+        target=preview_capture_thread,
+        args=(cam1, 1, frame_buffer, frame_lock, stop_preview_evt),
         daemon=True,
     )
     p2 = threading.Thread(
-        target=preview_thread,
-        args=(cam2, 2, stop_preview_evt),
+        target=preview_capture_thread,
+        args=(cam2, 2, frame_buffer, frame_lock, stop_preview_evt),
         daemon=True,
     )
 
     p1.start()
     p2.start()
 
-    MAGENTA("[Preview] Both cameras live. Close either window or press 'q' to stop.")
+    MAGENTA("[Preview] Both cameras live. Press 'q' or close a window to stop.")
+    if dir_arg:
+        MAGENTA(f"[Preview] Overlay source: {dir_arg}")
+
+    cv2.namedWindow("cam_1", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("cam_2", cv2.WINDOW_NORMAL)
+
+    overlays = {1: overlay1, 2: overlay2}
+
+    # --- Main-thread display loop ---
+    while not stop_preview_evt.is_set():
+        with frame_lock:
+            frames = dict(frame_buffer)
+
+        for cam_id, frame in frames.items():
+            display = frame
+            if overlays.get(cam_id) is not None:
+                display = blend_overlay(frame, overlays[cam_id])
+            cv2.imshow(f"cam_{cam_id}", display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            stop_preview_evt.set()
+            break
+
+        for win in ["cam_1", "cam_2"]:
+            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                stop_preview_evt.set()
+                break
+
+    cv2.destroyAllWindows()
 
     p1.join()
     p2.join()
 
     MAGENTA("[Preview] Preview closed. Flushing buffers before resuming acquisition...")
 
-    # Re-flush after preview to clear any frames left in the buffer
     for cam, cam_id in [(cam1, 1), (cam2, 2)]:
         cam.stream_on()
         flush_buffer(cam, cam_id)
@@ -261,7 +357,6 @@ def main():
     cam1 = device_manager.open_device_by_sn(dev_info_list[0]["sn"])
     cam2 = device_manager.open_device_by_sn(dev_info_list[1]["sn"])
 
-    # Initialise save dir attributes to singles by default
     cam1.current_save_dir = SINGLES_CAM1
     cam2.current_save_dir = SINGLES_CAM2
 
@@ -272,41 +367,35 @@ def main():
 
     trigger_evt1 = threading.Event()
     trigger_evt2 = threading.Event()
-    stop_evt = threading.Event()
 
     save_queue = queue.Queue()
 
-    t1 = threading.Thread(
-        target=capture_thread,
-        args=(cam1, 1, trigger_evt1, stop_evt, save_queue),
-        daemon=True,
-    )
-    t2 = threading.Thread(
-        target=capture_thread,
-        args=(cam2, 2, trigger_evt2, stop_evt, save_queue),
-        daemon=True,
-    )
+    # Save worker gets its own dedicated stop event so it is never
+    # accidentally killed by a capture-thread teardown
+    save_stop_evt = threading.Event()
     t_save = threading.Thread(
         target=save_worker,
-        args=(save_queue, stop_evt),
+        args=(save_queue, save_stop_evt),
         daemon=True,
     )
-
-    t1.start()
-    t2.start()
     t_save.start()
 
-    # Give capture threads time to complete buffer flush before accepting input
+    t1, t2, stop_evt = start_capture_threads(
+        cam1, cam2, trigger_evt1, trigger_evt2, save_queue
+    )
+
     time.sleep(1.0)
 
     loop_thread = None
     loop_counter = 0
 
     WHITE("\nCommands:")
-    WHITE("  [Enter]  — single trigger")
-    WHITE("  l        — start looped acquisition")
-    WHITE("  p        — preview camera streams")
-    WHITE("  q        — quit")
+    WHITE("  [Enter]      — single trigger")
+    WHITE("  l            — start looped acquisition")
+    WHITE("  p            — preview camera streams")
+    WHITE("  p singles    — preview with latest single-shot overlay")
+    WHITE("  p loop_N     — preview with latest image from loop N as overlay")
+    WHITE("  q            — quit")
 
     try:
         while True:
@@ -315,31 +404,31 @@ def main():
             if user_input == "q":
                 break
 
-            elif user_input == "p":
+            elif user_input.startswith("p"):
                 if loop_thread and loop_thread.is_alive():
                     RED("[Preview] Cannot preview while a loop is running.")
                     continue
-                # Pause capture threads by setting stop_evt, join, then relaunch after preview
-                stop_evt.set()
-                t1.join()
-                t2.join()
-                stop_evt.clear()
 
-                start_preview(cam1, cam2)
+                parts = user_input.split()
+                dir_arg = parts[1] if len(parts) > 1 else None
 
-                # Relaunch capture threads after preview closes
-                t1 = threading.Thread(
-                    target=capture_thread,
-                    args=(cam1, 1, trigger_evt1, stop_evt, save_queue),
-                    daemon=True,
+                if dir_arg is not None:
+                    valid = dir_arg == "singles" or (
+                        dir_arg.startswith("loop_") and dir_arg[5:].isdigit()
+                    )
+                    if not valid:
+                        RED(f"[Preview] Invalid directory '{dir_arg}'. Use 'singles' or 'loop_N'.")
+                        continue
+
+                # Cleanly tear down current capture threads with their own stop event
+                stop_capture_threads(t1, t2, stop_evt)
+
+                start_preview(cam1, cam2, dir_arg=dir_arg)
+
+                # Fresh stop event and new threads — no state bleed from previous run
+                t1, t2, stop_evt = start_capture_threads(
+                    cam1, cam2, trigger_evt1, trigger_evt2, save_queue
                 )
-                t2 = threading.Thread(
-                    target=capture_thread,
-                    args=(cam2, 2, trigger_evt2, stop_evt, save_queue),
-                    daemon=True,
-                )
-                t1.start()
-                t2.start()
                 time.sleep(1.0)
 
             elif user_input == "l":
@@ -380,11 +469,10 @@ def main():
     except KeyboardInterrupt:
         RED("\nInterrupted — shutting down...")
     finally:
-        stop_evt.set()
+        stop_capture_threads(t1, t2, stop_evt)
         if loop_thread:
             loop_thread.join(timeout=5)
-        t1.join()
-        t2.join()
+        save_stop_evt.set()
         save_queue.join()
         WHITE("[Save  ] All queued images have been written to disk.")
         t_save.join()
