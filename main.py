@@ -3,10 +3,12 @@ import queue
 import threading
 import time
 
+import cv2
 import gxipy as gx
 from PIL import Image
 from termcolor import colored
 
+# --- Session directory setup ---
 SESSION_DIR = time.strftime("out/acquisition_%Y%m%d_%H%M")
 SINGLES_CAM1 = os.path.join(SESSION_DIR, "singles", "cam_1")
 SINGLES_CAM2 = os.path.join(SESSION_DIR, "singles", "cam_2")
@@ -14,14 +16,17 @@ SINGLES_CAM2 = os.path.join(SESSION_DIR, "singles", "cam_2")
 for d in [SINGLES_CAM1, SINGLES_CAM2]:
     os.makedirs(d, exist_ok=True)
 
-WHITE = lambda x: print(x)
-CYAN = lambda x: print(colored(x, color="cyan"))  # capture thread
+# --- Colored print helpers ---
+WHITE  = lambda x: print(x)
+CYAN   = lambda x: print(colored(x, color="cyan"))    # capture thread
 YELLOW = lambda x: print(colored(x, color="yellow"))  # save worker
-GREEN = lambda x: print(colored(x, color="green"))  # loop controller
-RED = lambda x: print(colored(x, color="red"))  # errors
+GREEN  = lambda x: print(colored(x, color="green"))   # loop controller
+MAGENTA = lambda x: print(colored(x, color="magenta")) # preview
+RED    = lambda x: print(colored(x, color="red"))      # errors
 
 
 def make_loop_dirs(loop_n):
+    """Create and return (cam1_dir, cam2_dir) for a new loop run."""
     cam1_dir = os.path.join(SESSION_DIR, "loops", "cam_1", f"loop_{loop_n}")
     cam2_dir = os.path.join(SESSION_DIR, "loops", "cam_2", f"loop_{loop_n}")
     os.makedirs(cam1_dir, exist_ok=True)
@@ -30,6 +35,7 @@ def make_loop_dirs(loop_n):
 
 
 def flush_buffer(cam, cam_id):
+    """Drain stale pre-filled SDK buffer frames after stream_on."""
     flushed = 0
     while True:
         try:
@@ -44,6 +50,7 @@ def flush_buffer(cam, cam_id):
 
 
 def save_worker(save_queue, stop_event):
+    """Dedicated thread: drain the save queue and write images to disk."""
     while not stop_event.is_set() or not save_queue.empty():
         try:
             cam_id, numpy_image, timestamp, save_dir = save_queue.get(timeout=0.1)
@@ -58,12 +65,11 @@ def save_worker(save_queue, stop_event):
             RED(f"[Save  ] Cam {cam_id} save error: {e}")
         finally:
             save_queue.task_done()
-            YELLOW(
-                f"[Save  ] Cam {cam_id} buffer flushed. Queue depth: {save_queue.qsize()}."
-            )
+            YELLOW(f"[Save  ] Cam {cam_id} buffer flushed. Queue depth: {save_queue.qsize()}.")
 
 
 def capture_thread(cam, cam_id, trigger_event, stop_event, save_queue):
+    """Capture thread: flush stale buffer, then grab and queue images on trigger."""
     try:
         cam.stream_on()
         flush_buffer(cam, cam_id)
@@ -93,7 +99,101 @@ def capture_thread(cam, cam_id, trigger_event, stop_event, save_queue):
         CYAN(f"[Cam {cam_id}] Stream stopped.")
 
 
+def preview_thread(cam, cam_id, stop_preview_event):
+    """
+    Temporarily switches the camera to continuous (free-run) mode, streams
+    frames into an OpenCV window, then restores software trigger mode on exit.
+    Close the window or press 'q' inside it to stop.
+    """
+    window_name = f"cam_{cam_id}"
+    MAGENTA(f"[Preview] Cam {cam_id} starting. Press 'q' in the preview window to stop.")
+
+    try:
+        # --- Switch to continuous mode for free-running preview ---
+        cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
+        cam.stream_on()
+
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+        while not stop_preview_event.is_set():
+            raw_image = cam.data_stream[0].get_image(timeout=100)
+            if raw_image is None:
+                continue
+
+            numpy_image = raw_image.get_numpy_array()
+            if numpy_image is None:
+                continue
+
+            # Convert to BGR for OpenCV display (handles mono and colour)
+            if numpy_image.ndim == 2:
+                display = cv2.cvtColor(numpy_image, cv2.COLOR_GRAY2BGR)
+            else:
+                display = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
+
+            cv2.imshow(window_name, display)
+
+            # 'q' inside the window stops this camera's preview
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stop_preview_event.set()
+                break
+
+            # Also stop if the window was closed with the X button
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                stop_preview_event.set()
+                break
+
+    except Exception as e:
+        RED(f"[Preview] Cam {cam_id} error: {e}")
+    finally:
+        cam.stream_off()
+        cv2.destroyWindow(window_name)
+
+        # --- Restore software trigger mode ---
+        cam.TriggerMode.set(gx.GxSwitchEntry.ON)
+        cam.TriggerSource.set(gx.GxTriggerSourceEntry.SOFTWARE)
+
+        MAGENTA(f"[Preview] Cam {cam_id} stopped. Software trigger restored.")
+
+
+def start_preview(cam1, cam2):
+    """
+    Launch preview threads for both cameras. Blocks until both previews
+    are closed, then flushes buffers to prepare for triggered acquisition.
+    """
+    stop_preview_evt = threading.Event()
+
+    p1 = threading.Thread(
+        target=preview_thread,
+        args=(cam1, 1, stop_preview_evt),
+        daemon=True,
+    )
+    p2 = threading.Thread(
+        target=preview_thread,
+        args=(cam2, 2, stop_preview_evt),
+        daemon=True,
+    )
+
+    p1.start()
+    p2.start()
+
+    MAGENTA("[Preview] Both cameras live. Close either window or press 'q' to stop.")
+
+    p1.join()
+    p2.join()
+
+    MAGENTA("[Preview] Preview closed. Flushing buffers before resuming acquisition...")
+
+    # Re-flush after preview to clear any frames left in the buffer
+    for cam, cam_id in [(cam1, 1), (cam2, 2)]:
+        cam.stream_on()
+        flush_buffer(cam, cam_id)
+        cam.stream_off()
+
+    MAGENTA("[Preview] Ready for acquisition.")
+
+
 def fire_trigger(cam1, cam2, trigger_evt1, trigger_evt2, dir1, dir2):
+    """Attach destination directory to each camera, then fire both triggers."""
     cam1.current_save_dir = dir1
     cam2.current_save_dir = dir2
     trigger_evt1.set()
@@ -105,13 +205,12 @@ def fire_trigger(cam1, cam2, trigger_evt1, trigger_evt2, dir1, dir2):
 def loop_acquisition(
     cam1, cam2, trigger_evt1, trigger_evt2, stop_evt, interval_ms, count, loop_n
 ):
+    """Run a looped acquisition sequence in a background thread."""
     cam1_dir, cam2_dir = make_loop_dirs(loop_n)
     interval_s = interval_ms / 1000.0
 
     GREEN(f"[Loop {loop_n}] Starting: {count} acquisition(s) every {interval_ms} ms.")
-    GREEN(
-        f"[Loop {loop_n}] Saving to: loops/cam_1/loop_{loop_n} & loops/cam_2/loop_{loop_n}"
-    )
+    GREEN(f"[Loop {loop_n}] Saving to: loops/cam_1/loop_{loop_n} & loops/cam_2/loop_{loop_n}")
 
     for i in range(count):
         if stop_evt.is_set():
@@ -133,6 +232,7 @@ def loop_acquisition(
 
 
 def prompt_int(prompt, min_val=1, default=None):
+    """Prompt the user for a positive integer with optional default."""
     while True:
         suffix = f" [{default}]" if default is not None else ""
         raw = input(f"{prompt}{suffix}: ").strip()
@@ -161,6 +261,7 @@ def main():
     cam1 = device_manager.open_device_by_sn(dev_info_list[0]["sn"])
     cam2 = device_manager.open_device_by_sn(dev_info_list[1]["sn"])
 
+    # Initialise save dir attributes to singles by default
     cam1.current_save_dir = SINGLES_CAM1
     cam2.current_save_dir = SINGLES_CAM2
 
@@ -195,6 +296,7 @@ def main():
     t2.start()
     t_save.start()
 
+    # Give capture threads time to complete buffer flush before accepting input
     time.sleep(1.0)
 
     loop_thread = None
@@ -203,6 +305,7 @@ def main():
     WHITE("\nCommands:")
     WHITE("  [Enter]  — single trigger")
     WHITE("  l        — start looped acquisition")
+    WHITE("  p        — preview camera streams")
     WHITE("  q        — quit")
 
     try:
@@ -212,11 +315,36 @@ def main():
             if user_input == "q":
                 break
 
+            elif user_input == "p":
+                if loop_thread and loop_thread.is_alive():
+                    RED("[Preview] Cannot preview while a loop is running.")
+                    continue
+                # Pause capture threads by setting stop_evt, join, then relaunch after preview
+                stop_evt.set()
+                t1.join()
+                t2.join()
+                stop_evt.clear()
+
+                start_preview(cam1, cam2)
+
+                # Relaunch capture threads after preview closes
+                t1 = threading.Thread(
+                    target=capture_thread,
+                    args=(cam1, 1, trigger_evt1, stop_evt, save_queue),
+                    daemon=True,
+                )
+                t2 = threading.Thread(
+                    target=capture_thread,
+                    args=(cam2, 2, trigger_evt2, stop_evt, save_queue),
+                    daemon=True,
+                )
+                t1.start()
+                t2.start()
+                time.sleep(1.0)
+
             elif user_input == "l":
                 if loop_thread and loop_thread.is_alive():
-                    RED(
-                        "A loop is already running. Wait for it to finish or press 'q' to quit."
-                    )
+                    RED("A loop is already running. Wait for it to finish or press 'q' to quit.")
                     continue
 
                 interval_ms = prompt_int(
@@ -228,13 +356,10 @@ def main():
                 loop_thread = threading.Thread(
                     target=loop_acquisition,
                     args=(
-                        cam1,
-                        cam2,
-                        trigger_evt1,
-                        trigger_evt2,
+                        cam1, cam2,
+                        trigger_evt1, trigger_evt2,
                         stop_evt,
-                        interval_ms,
-                        count,
+                        interval_ms, count,
                         loop_counter,
                     ),
                     daemon=True,
@@ -244,16 +369,13 @@ def main():
             elif user_input == "":
                 WHITE("Triggering both cameras (single)...")
                 fire_trigger(
-                    cam1,
-                    cam2,
-                    trigger_evt1,
-                    trigger_evt2,
-                    SINGLES_CAM1,
-                    SINGLES_CAM2,
+                    cam1, cam2,
+                    trigger_evt1, trigger_evt2,
+                    SINGLES_CAM1, SINGLES_CAM2,
                 )
 
             else:
-                RED("Unknown command. Use [Enter], 'l', or 'q'.")
+                RED("Unknown command. Use [Enter], 'l', 'p', or 'q'.")
 
     except KeyboardInterrupt:
         RED("\nInterrupted — shutting down...")
