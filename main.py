@@ -7,6 +7,41 @@ import cv2
 import gxipy as gx
 from PIL import Image
 from termcolor import colored
+import json
+
+CONFIG_PATH = "config.json"
+
+def load_config():
+    """Load config.json from the project root. Returns empty dict if missing or malformed."""
+    if not os.path.exists(CONFIG_PATH):
+        WHITE(f"[Config] No config file found at {CONFIG_PATH}, using defaults.")
+        return {}
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            config = json.load(f)
+        WHITE(f"[Config] Loaded: {CONFIG_PATH}")
+        return config
+    except Exception as e:
+        RED(f"[Config] Failed to parse {CONFIG_PATH}: {e}. Using defaults.")
+        return {}
+
+
+def get_rotation(config, cam_id):
+    """Return the cv2 rotation code for a given camera, or None if no rotation set."""
+    key = f"cam_{cam_id}"
+    degrees = config.get(key, {}).get("rotation", 0)
+    return {
+        90:  cv2.ROTATE_90_CLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }.get(degrees, None)
+
+
+def apply_rotation(image, rotation_code):
+    """Rotate a numpy image if a rotation code is set."""
+    if rotation_code is None:
+        return image
+    return cv2.rotate(image, rotation_code)
 
 # --- Session directory setup ---
 SESSION_DIR = time.strftime("out/acquisition_%Y%m%d_%H%M")
@@ -49,7 +84,7 @@ def flush_buffer(cam, cam_id):
     CYAN(f"[Cam {cam_id}] Buffer flushed ({flushed} stale frame(s) discarded).")
 
 
-def save_worker(save_queue, stop_event):
+def save_worker(save_queue, stop_event, config):
     """Dedicated thread: drain the save queue and write images to disk."""
     while not stop_event.is_set() or not save_queue.empty():
         try:
@@ -57,6 +92,12 @@ def save_worker(save_queue, stop_event):
         except queue.Empty:
             continue
         try:
+            rotation_code = get_rotation(config, cam_id)
+
+            # Rotate via cv2 (faster than PIL), then convert back to PIL for saving
+            if rotation_code is not None:
+                numpy_image = cv2.rotate(numpy_image, rotation_code)
+
             pil_image = Image.fromarray(numpy_image)
             file_name = os.path.join(save_dir, f"cam_{cam_id}_{timestamp}.tiff")
             pil_image.save(file_name, format="TIFF", compression="raw")
@@ -168,11 +209,12 @@ def load_overlay(session_dir, dir_arg, cam_id):
     return img
 
 
-def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event):
+def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event, config):
     """
     Grab frames continuously in free-run mode and push the latest into
     frame_buffer. Display is handled on the main thread.
     """
+    rotation_code = get_rotation(config, cam_id)
     try:
         cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
         cam.stream_on()
@@ -192,6 +234,8 @@ def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_e
             else:
                 display = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
 
+            display = apply_rotation(display, rotation_code)
+
             with frame_lock:
                 frame_buffer[cam_id] = display
 
@@ -204,24 +248,7 @@ def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_e
         MAGENTA(f"[Preview] Cam {cam_id} stopped. Software trigger restored.")
 
 
-def blend_overlay(frame, overlay):
-    """
-    Resize overlay to match frame dimensions if needed, then alpha-blend
-    at 0.5 opacity onto the live frame.
-    """
-    if overlay.shape[:2] != frame.shape[:2]:
-        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
-    return cv2.addWeighted(frame, 1.0, overlay, 0.5, 0)
-
-
-def start_preview(cam1, cam2, dir_arg=None):
-    """
-    Launch frame-grabbing threads for both cameras, then run the OpenCV
-    display loop on the main thread until both windows are closed or
-    'q' is pressed. If dir_arg is provided, the latest image from that
-    sub-directory is loaded per camera and overlaid at 0.5 opacity.
-    """
-    # Load overlays before starting threads so errors surface early
+def start_preview(cam1, cam2, config, dir_arg=None):
     overlay1 = load_overlay(SESSION_DIR, dir_arg, 1) if dir_arg else None
     overlay2 = load_overlay(SESSION_DIR, dir_arg, 2) if dir_arg else None
 
@@ -231,12 +258,12 @@ def start_preview(cam1, cam2, dir_arg=None):
 
     p1 = threading.Thread(
         target=preview_capture_thread,
-        args=(cam1, 1, frame_buffer, frame_lock, stop_preview_evt),
+        args=(cam1, 1, frame_buffer, frame_lock, stop_preview_evt, config),
         daemon=True,
     )
     p2 = threading.Thread(
         target=preview_capture_thread,
-        args=(cam2, 2, frame_buffer, frame_lock, stop_preview_evt),
+        args=(cam2, 2, frame_buffer, frame_lock, stop_preview_evt, config),
         daemon=True,
     )
 
@@ -252,7 +279,6 @@ def start_preview(cam1, cam2, dir_arg=None):
 
     overlays = {1: overlay1, 2: overlay2}
 
-    # --- Main-thread display loop ---
     while not stop_preview_evt.is_set():
         with frame_lock:
             frames = dict(frame_buffer)
@@ -274,18 +300,25 @@ def start_preview(cam1, cam2, dir_arg=None):
                 break
 
     cv2.destroyAllWindows()
-
     p1.join()
     p2.join()
 
     MAGENTA("[Preview] Preview closed. Flushing buffers before resuming acquisition...")
-
     for cam, cam_id in [(cam1, 1), (cam2, 2)]:
         cam.stream_on()
         flush_buffer(cam, cam_id)
         cam.stream_off()
-
     MAGENTA("[Preview] Ready for acquisition.")
+
+
+def blend_overlay(frame, overlay):
+    """
+    Resize overlay to match frame dimensions if needed, then alpha-blend
+    at 0.5 opacity onto the live frame.
+    """
+    if overlay.shape[:2] != frame.shape[:2]:
+        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
+    return cv2.addWeighted(frame, 1.0, overlay, 0.5, 0)
 
 
 def fire_trigger(cam1, cam2, trigger_evt1, trigger_evt2, dir1, dir2):
@@ -344,6 +377,8 @@ def prompt_int(prompt, min_val=1, default=None):
 
 
 def main():
+    config = load_config()
+
     device_manager = gx.DeviceManager()
     dev_num, dev_info_list = device_manager.update_device_list()
 
@@ -370,12 +405,10 @@ def main():
 
     save_queue = queue.Queue()
 
-    # Save worker gets its own dedicated stop event so it is never
-    # accidentally killed by a capture-thread teardown
     save_stop_evt = threading.Event()
     t_save = threading.Thread(
         target=save_worker,
-        args=(save_queue, save_stop_evt),
+        args=(save_queue, save_stop_evt, config),
         daemon=True,
     )
     t_save.start()
@@ -420,12 +453,8 @@ def main():
                         RED(f"[Preview] Invalid directory '{dir_arg}'. Use 'singles' or 'loop_N'.")
                         continue
 
-                # Cleanly tear down current capture threads with their own stop event
                 stop_capture_threads(t1, t2, stop_evt)
-
-                start_preview(cam1, cam2, dir_arg=dir_arg)
-
-                # Fresh stop event and new threads — no state bleed from previous run
+                start_preview(cam1, cam2, config, dir_arg=dir_arg)
                 t1, t2, stop_evt = start_capture_threads(
                     cam1, cam2, trigger_evt1, trigger_evt2, save_queue
                 )
