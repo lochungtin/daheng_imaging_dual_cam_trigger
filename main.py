@@ -246,26 +246,24 @@ def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_e
         cam.stream_on()
         MAGENTA(f"[Preview] Cam {cam_id} capture started.")
 
-        while not stop_preview_evt.is_set():
+        while not stop_preview_event.is_set():
+            raw_image = cam.data_stream[0].get_image(timeout=100)
+            if raw_image is None:
+                continue
+
+            numpy_image = raw_image.get_numpy_array()
+            if numpy_image is None:
+                continue
+
+            if numpy_image.ndim == 2:
+                display = cv2.cvtColor(numpy_image, cv2.COLOR_GRAY2BGR)
+            else:
+                display = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
+
+            display = apply_rotation(display, rotation_code)
+
             with frame_lock:
-                frames = dict(frame_buffer)
-
-            for cam_id, frame in frames.items():
-                if overlays.get(cam_id) is not None:
-                    display = blend_overlay(frame, overlays[cam_id])
-                else:
-                    display = apply_tint(frame, b=1.0, g=0.0, r=1.0)
-                cv2.imshow(f"cam_{cam_id}", display)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                stop_preview_evt.set()
-                break
-
-            for win in ["cam_1", "cam_2"]:
-                if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
-                    stop_preview_evt.set()
-                    break
+                frame_buffer[cam_id] = display
 
     except Exception as e:
         RED(f"[Preview] Cam {cam_id} capture error: {e}")
@@ -338,16 +336,6 @@ def start_preview(cam1, cam2, config, dir_arg=None):
         flush_buffer(cam, cam_id)
         cam.stream_off()
     MAGENTA("[Preview] Ready for acquisition.")
-
-
-def blend_overlay(frame, overlay):
-    """
-    Resize overlay to match frame dimensions if needed, then alpha-blend
-    at 0.5 opacity onto the live frame.
-    """
-    if overlay.shape[:2] != frame.shape[:2]:
-        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
-    return cv2.addWeighted(frame, 1.0, overlay, 0.5, 0)
 
 
 def fire_trigger(cam1, cam2, trigger_evt1, trigger_evt2, dir1, dir2):
