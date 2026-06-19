@@ -5,6 +5,7 @@ import time
 
 import cv2
 import gxipy as gx
+import numpy as np
 from PIL import Image
 from termcolor import colored
 import json
@@ -220,11 +221,35 @@ def apply_tint(image, b, g, r):
     return tinted.clip(0, 255).astype("uint8")
 
 
-def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event, config, overlay):
+def make_tint_lut(b, g, r):
+    """
+    Build a per-channel LUT for tinting. Applied via cv2.LUT which is
+    far faster than float32 multiply across the full image.
+    """
+    lut = np.zeros((256, 1, 3), dtype=np.uint8)
+    lut[:, 0, 0] = (np.arange(256) * b).clip(0, 255).astype(np.uint8)
+    lut[:, 0, 1] = (np.arange(256) * g).clip(0, 255).astype(np.uint8)
+    lut[:, 0, 2] = (np.arange(256) * r).clip(0, 255).astype(np.uint8)
+    return lut
+
+MAGENTA_LUT = make_tint_lut(b=1.0, g=0.0, r=1.0)
+GREEN_LUT   = make_tint_lut(b=0.0, g=1.0, r=0.0)
+
+
+def apply_tint_lut(image, lut):
+    """Apply a pre-built tint LUT. Much faster than float32 multiply."""
+    return cv2.LUT(image, lut)
+
+
+def preview_capture_thread(cam, cam_id, frame_slot, frame_lock, new_frame_event, stop_preview_event, config, overlay):
+    """
+    frame_slot: a one-element list [None] used as a mutable cell so the
+    capture thread can replace the frame without a dict lookup.
+    frame_lock: per-camera lock — no cross-camera contention.
+    new_frame_event: set each time a fresh frame is deposited.
+    """
     rotation_code = get_rotation(config, cam_id)
     has_overlay = overlay is not None
-
-    # Pre-resize overlay once here rather than every frame in blend_overlay
     resized_overlay = None
 
     try:
@@ -249,17 +274,20 @@ def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_e
             display = apply_rotation(display, rotation_code)
 
             if has_overlay:
-                # Resize overlay once on the first frame when we know frame dimensions
                 if resized_overlay is None:
                     h, w = display.shape[:2]
-                    resized_overlay = cv2.resize(overlay, (w, h)) if overlay.shape[:2] != (h, w) else overlay
-                    resized_overlay = apply_tint(resized_overlay, b=0.0, g=1.0, r=0.0)
+                    resized_overlay = cv2.resize(overlay, (w, h)) if overlay.shape[:2] != (h, w) else overlay.copy()
+                    resized_overlay = apply_tint_lut(resized_overlay, GREEN_LUT)
 
-                magenta_frame = apply_tint(display, b=1.0, g=0.0, r=1.0)
-                display = cv2.addWeighted(magenta_frame, 1.0, resized_overlay, 0.5, 0)
+                display = cv2.addWeighted(
+                    apply_tint_lut(display, MAGENTA_LUT), 1.0,
+                    resized_overlay, 0.5, 0
+                )
 
             with frame_lock:
-                frame_buffer[cam_id] = display
+                frame_slot[0] = display
+
+            new_frame_event.set()
 
     except Exception as e:
         RED(f"[Preview] Cam {cam_id} capture error: {e}")
@@ -274,18 +302,20 @@ def start_preview(cam1, cam2, config, dir_arg=None):
     overlay1 = load_overlay(SESSION_DIR, dir_arg, 1) if dir_arg else None
     overlay2 = load_overlay(SESSION_DIR, dir_arg, 2) if dir_arg else None
 
-    frame_buffer = {}
-    frame_lock = threading.Lock()
+    # Per-camera slots and locks — no cross-camera contention
+    slot1, slot2   = [None], [None]
+    lock1, lock2   = threading.Lock(), threading.Lock()
+    evt1,  evt2    = threading.Event(), threading.Event()
     stop_preview_evt = threading.Event()
 
     p1 = threading.Thread(
         target=preview_capture_thread,
-        args=(cam1, 1, frame_buffer, frame_lock, stop_preview_evt, config, overlay1),
+        args=(cam1, 1, slot1, lock1, evt1, stop_preview_evt, config, overlay1),
         daemon=True,
     )
     p2 = threading.Thread(
         target=preview_capture_thread,
-        args=(cam2, 2, frame_buffer, frame_lock, stop_preview_evt, config, overlay2),
+        args=(cam2, 2, slot2, lock2, evt2, stop_preview_evt, config, overlay2),
         daemon=True,
     )
 
@@ -299,13 +329,21 @@ def start_preview(cam1, cam2, config, dir_arg=None):
     cv2.namedWindow("cam_1", cv2.WINDOW_NORMAL)
     cv2.namedWindow("cam_2", cv2.WINDOW_NORMAL)
 
-    # Display loop is now just imshow — all processing done in capture threads
     while not stop_preview_evt.is_set():
-        with frame_lock:
-            frames = dict(frame_buffer)
+        # Only redraw a camera if a new frame actually arrived
+        if evt1.is_set():
+            with lock1:
+                frame = slot1[0]
+            if frame is not None:
+                cv2.imshow("cam_1", frame)
+            evt1.clear()
 
-        for cam_id, frame in frames.items():
-            cv2.imshow(f"cam_{cam_id}", frame)
+        if evt2.is_set():
+            with lock2:
+                frame = slot2[0]
+            if frame is not None:
+                cv2.imshow("cam_2", frame)
+            evt2.clear()
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -327,6 +365,7 @@ def start_preview(cam1, cam2, config, dir_arg=None):
         flush_buffer(cam, cam_id)
         cam.stream_off()
     MAGENTA("[Preview] Ready for acquisition.")
+
 
 
 def fire_trigger(cam1, cam2, trigger_evt1, trigger_evt2, dir1, dir2):
