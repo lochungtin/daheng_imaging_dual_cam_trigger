@@ -312,9 +312,10 @@ def start_preview(cam1, cam2, config, dir_arg=None):
             frames = dict(frame_buffer)
 
         for cam_id, frame in frames.items():
-            display = frame
             if overlays.get(cam_id) is not None:
                 display = blend_overlay(frame, overlays[cam_id])
+            else:
+                display = apply_tint(frame, b=1.0, g=0.0, r=1.0)
             cv2.imshow(f"cam_{cam_id}", display)
 
         key = cv2.waitKey(1) & 0xFF
