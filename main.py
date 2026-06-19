@@ -326,6 +326,7 @@ def start_preview(cam1, cam2, config, dir_arg=None):
                 stop_preview_evt.set()
                 break
 
+
     cv2.destroyAllWindows()
     p1.join()
     p2.join()
