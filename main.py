@@ -220,27 +220,13 @@ def apply_tint(image, b, g, r):
     return tinted.clip(0, 255).astype("uint8")
 
 
-def blend_overlay(frame, overlay):
-    """
-    Resize overlay to match frame if needed.
-    Live frame is tinted magenta (full R, no G, full B).
-    Overlay is tinted green (no R, full G, no B).
-    Blended at equal 0.5 weight.
-    """
-    if overlay.shape[:2] != frame.shape[:2]:
-        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
-
-    magenta_frame = apply_tint(frame,   b=1.0, g=0.0, r=1.0)
-    green_overlay = apply_tint(overlay, b=0.0, g=1.0, r=0.0)
-
-    return cv2.addWeighted(magenta_frame, 1.0, green_overlay, 0.5, 0)
-
-def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event, config):
-    """
-    Grab frames continuously in free-run mode and push the latest into
-    frame_buffer. Display is handled on the main thread.
-    """
+def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event, config, overlay):
     rotation_code = get_rotation(config, cam_id)
+    has_overlay = overlay is not None
+
+    # Pre-resize overlay once here rather than every frame in blend_overlay
+    resized_overlay = None
+
     try:
         cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
         cam.stream_on()
@@ -261,6 +247,16 @@ def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_e
                 display = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
 
             display = apply_rotation(display, rotation_code)
+
+            if has_overlay:
+                # Resize overlay once on the first frame when we know frame dimensions
+                if resized_overlay is None:
+                    h, w = display.shape[:2]
+                    resized_overlay = cv2.resize(overlay, (w, h)) if overlay.shape[:2] != (h, w) else overlay
+                    resized_overlay = apply_tint(resized_overlay, b=0.0, g=1.0, r=0.0)
+
+                magenta_frame = apply_tint(display, b=1.0, g=0.0, r=1.0)
+                display = cv2.addWeighted(magenta_frame, 1.0, resized_overlay, 0.5, 0)
 
             with frame_lock:
                 frame_buffer[cam_id] = display
@@ -284,12 +280,12 @@ def start_preview(cam1, cam2, config, dir_arg=None):
 
     p1 = threading.Thread(
         target=preview_capture_thread,
-        args=(cam1, 1, frame_buffer, frame_lock, stop_preview_evt, config),
+        args=(cam1, 1, frame_buffer, frame_lock, stop_preview_evt, config, overlay1),
         daemon=True,
     )
     p2 = threading.Thread(
         target=preview_capture_thread,
-        args=(cam2, 2, frame_buffer, frame_lock, stop_preview_evt, config),
+        args=(cam2, 2, frame_buffer, frame_lock, stop_preview_evt, config, overlay2),
         daemon=True,
     )
 
@@ -303,18 +299,13 @@ def start_preview(cam1, cam2, config, dir_arg=None):
     cv2.namedWindow("cam_1", cv2.WINDOW_NORMAL)
     cv2.namedWindow("cam_2", cv2.WINDOW_NORMAL)
 
-    overlays = {1: overlay1, 2: overlay2}
-
+    # Display loop is now just imshow — all processing done in capture threads
     while not stop_preview_evt.is_set():
         with frame_lock:
             frames = dict(frame_buffer)
 
         for cam_id, frame in frames.items():
-            if overlays.get(cam_id) is not None:
-                display = blend_overlay(frame, overlays[cam_id])
-            else:
-                display = frame
-            cv2.imshow(f"cam_{cam_id}", display)
+            cv2.imshow(f"cam_{cam_id}", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
