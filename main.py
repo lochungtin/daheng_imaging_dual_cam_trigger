@@ -208,6 +208,32 @@ def load_overlay(session_dir, dir_arg, cam_id):
     MAGENTA(f"[Preview] Cam {cam_id} overlay loaded: {latest}")
     return img
 
+def apply_tint(image, b, g, r):
+    """
+    Multiply each BGR channel by a scalar in [0.0, 1.0] to tint the image.
+    b, g, r are the channel multipliers.
+    """
+    tinted = image.astype("float32")
+    tinted[:, :, 0] *= b
+    tinted[:, :, 1] *= g
+    tinted[:, :, 2] *= r
+    return tinted.clip(0, 255).astype("uint8")
+
+
+def blend_overlay(frame, overlay):
+    """
+    Resize overlay to match frame if needed.
+    Live frame is tinted magenta (full R, no G, full B).
+    Overlay is tinted green (no R, full G, no B).
+    Blended at equal 0.5 weight.
+    """
+    if overlay.shape[:2] != frame.shape[:2]:
+        overlay = cv2.resize(overlay, (frame.shape[1], frame.shape[0]))
+
+    magenta_frame = apply_tint(frame,   b=1.0, g=0.0, r=1.0)
+    green_overlay = apply_tint(overlay, b=0.0, g=1.0, r=0.0)
+
+    return cv2.addWeighted(magenta_frame, 1.0, green_overlay, 0.5, 0)
 
 def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_event, config):
     """
@@ -220,24 +246,26 @@ def preview_capture_thread(cam, cam_id, frame_buffer, frame_lock, stop_preview_e
         cam.stream_on()
         MAGENTA(f"[Preview] Cam {cam_id} capture started.")
 
-        while not stop_preview_event.is_set():
-            raw_image = cam.data_stream[0].get_image(timeout=100)
-            if raw_image is None:
-                continue
-
-            numpy_image = raw_image.get_numpy_array()
-            if numpy_image is None:
-                continue
-
-            if numpy_image.ndim == 2:
-                display = cv2.cvtColor(numpy_image, cv2.COLOR_GRAY2BGR)
-            else:
-                display = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
-
-            display = apply_rotation(display, rotation_code)
-
+        while not stop_preview_evt.is_set():
             with frame_lock:
-                frame_buffer[cam_id] = display
+                frames = dict(frame_buffer)
+
+            for cam_id, frame in frames.items():
+                if overlays.get(cam_id) is not None:
+                    display = blend_overlay(frame, overlays[cam_id])
+                else:
+                    display = apply_tint(frame, b=1.0, g=0.0, r=1.0)
+                cv2.imshow(f"cam_{cam_id}", display)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                stop_preview_evt.set()
+                break
+
+            for win in ["cam_1", "cam_2"]:
+                if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                    stop_preview_evt.set()
+                    break
 
     except Exception as e:
         RED(f"[Preview] Cam {cam_id} capture error: {e}")
